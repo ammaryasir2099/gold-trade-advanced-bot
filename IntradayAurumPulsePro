@@ -1,0 +1,204 @@
+//+------------------------------------------------------------------+
+//|                                         IntradayAurumPulsePro.mq5 |
+//|              Signal-Based Adaptive Trailing Bot (XAUUSDm)         |
+//|                  Created for MQL5 Marketplace by Rana Ammar Yasir |
+//+------------------------------------------------------------------+
+#property copyright "Rana Ammar Yasir"
+#property version   "1.11"
+#property strict
+#property description "IntradayAurumPulsePro: Broker-independent adaptive signal bot with auto trailing TP, normalized lots, and smart intraday filters."
+#property script_show_inputs
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\SymbolInfo.mqh>
+
+CTrade trade;
+CPositionInfo position;
+CSymbolInfo symbol;
+
+input string TradeSymbol = "XAUUSDm";
+input ENUM_TIMEFRAMES Timeframe = PERIOD_M5;
+input bool UseAdaptiveTP = true;
+input double BaseLot = 0.01;
+input double TrailingStart = 5.0;
+input double TrailStep = 1.0;
+input int MaxEntries = 5;
+input double EquityThreshold1 = 200;
+input double EquityThreshold2 = 300;
+input double EquityThreshold3 = 400;
+input double EquityThreshold4 = 500;
+input double MaxRiskUSD = 50.0;
+input int MagicNumber = 123456;
+input int TradingStartHour = 6;
+input int TradingEndHour = 20;
+input double Slippage = 5.0;
+
+int currentEntry = 0;
+bool allowEntry = true;
+
+int rsiHandle, maHandle, cciHandle, atrHandle;
+
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   symbol.Name(TradeSymbol);
+   rsiHandle = iRSI(TradeSymbol, Timeframe, 14, PRICE_CLOSE);
+   maHandle = iMA(TradeSymbol, Timeframe, 20, 0, MODE_SMA, PRICE_CLOSE);
+   cciHandle = iCCI(TradeSymbol, Timeframe, 14, PRICE_TYPICAL);
+   atrHandle = iATR(TradeSymbol, Timeframe, 14);
+   return INIT_SUCCEEDED;
+  }
+
+void OnDeinit(const int reason)
+  {
+   IndicatorRelease(rsiHandle);
+   IndicatorRelease(maHandle);
+   IndicatorRelease(cciHandle);
+   IndicatorRelease(atrHandle);
+  }
+
+void OnTick()
+  {
+   if(!IsNewBar()) return;
+   if(!CheckTradingAllowed()) return;
+
+   if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_NETTING && PositionSelect(TradeSymbol))
+      trade.PositionClose(TradeSymbol);
+   else if(PositionSelect(TradeSymbol)) return;
+
+   double lot = CalculateLotSize();
+   ENUM_ORDER_TYPE orderType = DetermineTradeSignal();
+   if(orderType != ORDER_TYPE_BUY && orderType != ORDER_TYPE_SELL) return;
+
+   double price = (orderType == ORDER_TYPE_BUY) ? SymbolInfoDouble(TradeSymbol, SYMBOL_ASK) : SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
+
+   double atrValue[1];
+   if(CopyBuffer(atrHandle, 0, 0, 1, atrValue) <= 0 || atrValue[0] == 0.0)
+      atrValue[0] = 1.0; // fallback
+
+   double sl = (orderType == ORDER_TYPE_BUY) ? price - 2 * atrValue[0] : price + 2 * atrValue[0];
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints((int)Slippage);
+
+   if(!trade.PositionOpen(TradeSymbol, orderType, lot, price, sl, 0.0, "Entry#" + IntegerToString(currentEntry + 1)))
+     Print("Trade failed: ", trade.ResultRetcode(), " - " , trade.ResultRetcodeDescription());
+   else
+     {
+      Print("Opening ", EnumToString(orderType), " at ", DoubleToString(price, _Digits), " | Entry#", currentEntry + 1);
+      currentEntry++;
+      if(currentEntry >= MaxEntries) currentEntry = 0;
+     }
+  }
+
+void OnTrade()
+  {
+   if(!PositionSelect(TradeSymbol)) return;
+   double profit = PositionGetDouble(POSITION_PROFIT);
+   double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+   if(profit >= 20)
+     {
+      double newSL = (type == POSITION_TYPE_BUY) ? entryPrice + 1 * _Point : entryPrice - 1 * _Point;
+      trade.PositionModify(TradeSymbol, newSL, 0);
+     }
+
+   if(profit >= 30 && UseAdaptiveTP)
+     {
+      double trailSL = (type == POSITION_TYPE_BUY)
+         ? SymbolInfoDouble(TradeSymbol, SYMBOL_BID) - TrailStep * _Point
+         : SymbolInfoDouble(TradeSymbol, SYMBOL_ASK) + TrailStep * _Point;
+      trade.PositionModify(TradeSymbol, trailSL, 0);
+     }
+  }
+
+ENUM_ORDER_TYPE DetermineTradeSignal()
+  {
+   if(rsiHandle == INVALID_HANDLE || maHandle == INVALID_HANDLE || cciHandle == INVALID_HANDLE)
+      return WRONG_VALUE;
+
+   double rsiValue[1], maValue[1], cciValue[1];
+   if(CopyBuffer(rsiHandle, 0, 0, 1, rsiValue) <= 0 || CopyBuffer(maHandle, 0, 0, 1, maValue) <= 0 || CopyBuffer(cciHandle, 0, 0, 1, cciValue) <= 0)
+      return WRONG_VALUE;
+
+   double price = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
+
+   if(currentEntry == 0 && (rsiValue[0] < 50 || cciValue[0] > -50))
+      return ORDER_TYPE_BUY;
+   else if(currentEntry == 1 && (rsiValue[0] < 55 && cciValue[0] > -75))
+      return ORDER_TYPE_BUY;
+   else if(currentEntry == 2 && (rsiValue[0] < 60 && cciValue[0] > -100))
+      return ORDER_TYPE_BUY;
+   else if(currentEntry == 3 && (rsiValue[0] < 65 && cciValue[0] > -120))
+      return ORDER_TYPE_BUY;
+   else if(currentEntry == 4 && (rsiValue[0] < 70 && cciValue[0] > -150))
+      return ORDER_TYPE_BUY;
+
+   if(currentEntry == 0 && (rsiValue[0] > 50 || cciValue[0] < 50))
+      return ORDER_TYPE_SELL;
+   else if(currentEntry == 1 && (rsiValue[0] > 45 && cciValue[0] < 75))
+      return ORDER_TYPE_SELL;
+   else if(currentEntry == 2 && (rsiValue[0] > 40 && cciValue[0] < 100))
+      return ORDER_TYPE_SELL;
+   else if(currentEntry == 3 && (rsiValue[0] > 35 && cciValue[0] < 120))
+      return ORDER_TYPE_SELL;
+   else if(currentEntry == 4 && (rsiValue[0] > 30 && cciValue[0] < 150))
+      return ORDER_TYPE_SELL;
+
+   return WRONG_VALUE;
+  }
+
+double NormalizeLot(double lot)
+  {
+   double minLot = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MIN);
+   double step = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_STEP);
+   return MathMax(minLot, NormalizeDouble(MathFloor(lot / step) * step, 2));
+  }
+
+double CalculateLotSize()
+  {
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double rawLot = BaseLot;
+
+   if(balance < EquityThreshold1)
+      rawLot = 0.01;
+   else if(balance < EquityThreshold2)
+      rawLot = 0.01;
+   else if(balance < EquityThreshold3)
+      rawLot = 0.02;
+   else if(balance < EquityThreshold4)
+      rawLot = 0.03;
+   else
+      rawLot = 0.02;
+
+   return NormalizeLot(rawLot);
+  }
+
+bool IsNewBar()
+  {
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(TradeSymbol, Timeframe, 0);
+   if(currentBarTime != lastBarTime)
+     {
+      lastBarTime = currentBarTime;
+      return true;
+     }
+   return false;
+  }
+
+bool CheckTradingAllowed()
+  {
+   datetime now = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(now, dt);
+   int hour = dt.hour;
+
+   if(hour < TradingStartHour || hour >= TradingEndHour) return false;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return false;
+   if(AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) == 0) return false;
+   if(!SymbolInfoInteger(TradeSymbol, SYMBOL_TRADE_MODE)) return false;
+   return true;
+  }
+//+------------------------------------------------------------------+
